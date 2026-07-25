@@ -1,0 +1,56 @@
+name: Expensify bug+daily issue notifier
+
+# Runs on a schedule in YOUR OWN repo. It only READS the public
+# Expensify/App issues via the GitHub API — no access to that repo is needed.
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub cron is UTC and may be delayed on free runners.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+# Needed so the workflow can commit the updated state file back to the repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: issue-notifier
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run notifier
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # GITHUB_TOKEN is auto-provided; used only to raise the API rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: Expensify/App
+          LABELS: bug,daily
+          STATE_FILE: seen_issues.json
+          # One-shot mode: the workflow itself is the scheduler, so the script
+          # must check once and exit instead of looping forever.
+          RUN_ONCE: "true"
+        run: python3 scripts/telegram_issue_notifier.py
+
+      - name: Persist state
+        run: |
+          if [[ -n "$(git status --porcelain seen_issues.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add seen_issues.json
+            git commit -m "Update seen issues state [skip ci]"
+            git push
+          else
+            echo "No state change."
+          fi
