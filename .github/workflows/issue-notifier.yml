@@ -1,16 +1,11 @@
-name: Expensify issue notifier
+name: Help Wanted notifier
 
-# Runs in YOUR OWN repo. It only READS the public Expensify/App issues via the
-# GitHub API - no access to that repo is needed.
-#
-# Latency strategy: GitHub's cron is unreliable (5 min minimum, often delayed
-# 10-40 min on free runners). So instead of one quick check per trigger, each
-# run POLLS CONTINUOUSLY for ~14 minutes at 60-second intervals. Cron only has
-# to start the job; the job itself provides the fine-grained timing.
+# Runs in YOUR OWN repo, reading the public Expensify/App event stream.
+# Cron only starts the job; the job itself polls every 60s for ~14 minutes,
+# because GitHub's scheduler is often 10-40 minutes late on free runners.
 
 on:
   schedule:
-    # Every 15 minutes (UTC). Each run covers ~14 of those 15 minutes.
     - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
@@ -18,22 +13,18 @@ permissions:
   contents: write
 
 concurrency:
-  group: issue-notifier
-  # If a previous long-poll is somehow still running when the next trigger
-  # fires, kill it rather than queueing - the new run picks up the state file.
+  group: help-wanted-notifier
   cancel-in-progress: true
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 16   # hard stop, in case the script ever hangs
+    timeout-minutes: 16
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -41,43 +32,31 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Auto-provided token; used only to raise the API rate limit.
           GITHUB_TOKEN: ${{ github.token }}
           REPO: Expensify/App
-          # Replaces the old LABELS variable. Each entry is an AND-set of labels
-          # and gets its own notification + its own seen-list.
-          WATCH_GROUPS: >-
-            [
-              {"name": "bug-daily",   "labels": ["Bug", "Daily"], "emoji": "🐛"},
-              {"name": "help-wanted", "labels": ["Help Wanted"],  "emoji": "🙋"}
-            ]
-          STATE_FILE: seen_issues.json
-          RUN_ONCE: "false"              # loop inside the job
+          LABEL: Help Wanted
+          STATE_FILE: last_event.json
+          RUN_ONCE: "false"
           POLL_INTERVAL_SECONDS: "60"
-          MAX_RUNTIME_SECONDS: "840"     # 14 minutes, leaves headroom before the next cron
-          SHOW_LABEL_LAG: "true"
-        run: python3 scripts/telegram_issue_notifier.py
+          MAX_RUNTIME_SECONDS: "840"
+        run: python3 scripts/help_wanted_notifier.py
 
       - name: Persist state
-        # Runs even if the notifier step was cancelled or errored, so issues
-        # already announced are not announced twice.
         if: always()
         run: |
-          if [[ -z "$(git status --porcelain seen_issues.json)" ]]; then
+          if [[ -z "$(git status --porcelain last_event.json)" ]]; then
             echo "No state change."
             exit 0
           fi
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_issues.json
-          git commit -m "Update seen issues state [skip ci]"
-          # Another run may have pushed while we were polling; rebase then retry.
+          git add last_event.json
+          git commit -m "Update last event id [skip ci]"
           for attempt in 1 2 3; do
             if git pull --rebase --autostash && git push; then
-              echo "State pushed on attempt $attempt."
               exit 0
             fi
             sleep 5
           done
-          echo "Could not push state after 3 attempts." >&2
+          echo "Could not push state." >&2
           exit 1
