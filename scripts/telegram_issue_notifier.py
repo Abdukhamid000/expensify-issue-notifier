@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
 """
-Telegram notifier for Expensify/App GitHub issues.
+Telegram notifier: fires when the `Help Wanted` label is ADDED to an issue.
 
-Watches several *label groups* at once (e.g. `Bug`+`Daily`, and `Help Wanted`)
-and sends a Telegram message the moment an issue enters one of those groups --
-including when the label is added to an issue that already existed.
+How it works
+------------
+Instead of asking "which issues currently have this label?" (which cannot tell
+you *when* the label appeared), this polls the repository's issue-event stream:
 
-Why this version is faster than the previous one
-------------------------------------------------
-1. Sorts by `updated` instead of `created`. When a label is added to an old
-   issue, its `created_at` does not change, so a `created`-sorted page of 50
-   would never show it. `updated_at` *does* change on labeling.
-2. Uses the `since` parameter, so each poll only asks for issues touched since
-   the last check -> tiny responses -> safe to poll every 30-60 seconds.
-3. Tracks seen issues *per group*, so an issue already announced as Bug+Daily
-   is announced again when `Help Wanted` is later added to it.
-4. Optionally reports how old the labeling event is, so you can see whether the
-   remaining lag is this script or something upstream.
+    GET /repos/{owner}/{repo}/issues/events
+
+That stream contains one `labeled` event per label application, newest first,
+with the exact timestamp and who did it. The script keeps a high-water mark of
+the newest event id it has processed, so:
+
+  * old issues are never announced -- on the first run it just records the
+    current newest event id and stays quiet,
+  * you are notified the moment the label lands, not when the issue was created,
+  * if the label is removed and re-added, that counts as a new event.
 
 Setup
 -----
-1. Create a bot with @BotFather -> BOT TOKEN.
+1. @BotFather -> BOT TOKEN.
 2. Message the bot, open https://api.telegram.org/bot<TOKEN>/getUpdates,
    copy "chat":{"id": ...} -> CHAT ID.
-3. A GitHub token is now effectively required: 60 req/hr unauthenticated is not
-   enough for minute-level polling. A classic token with no scopes is fine.
+3. GITHUB_TOKEN: any token with no scopes. Raises the limit to 5000 req/hour.
 
 Run
 ---
     export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
     export TELEGRAM_CHAT_ID="987654321"
     export GITHUB_TOKEN="ghp_..."
-    export POLL_INTERVAL_SECONDS=60
-    python3 telegram_issue_notifier.py
+    python3 help_wanted_notifier.py
 
 Only stdlib is used.
 """
@@ -47,136 +45,95 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# --- Configuration -----------------------------------------------------------
-
 REPO = os.environ.get("REPO", "Expensify/App")
-
-# Each group is an AND-set of labels. An issue matching a group triggers one
-# notification for that group. Override with the WATCH_GROUPS env var (JSON).
-DEFAULT_WATCH_GROUPS = [
-    {"name": "bug-daily", "labels": ["Bug", "Daily"], "emoji": "🐛"},
-    {"name": "help-wanted", "labels": ["Help Wanted"], "emoji": "🙋"},
-]
-
-try:
-    WATCH_GROUPS = json.loads(os.environ["WATCH_GROUPS"])
-except KeyError:
-    WATCH_GROUPS = DEFAULT_WATCH_GROUPS
-except json.JSONDecodeError as exc:
-    print(f"ERROR: WATCH_GROUPS is not valid JSON: {exc}", file=sys.stderr)
-    sys.exit(1)
-
+LABEL = os.environ.get("LABEL", "Help Wanted")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
-# Re-scan a little further back than the last check, so nothing falls through
-# the gap between two polls (clock skew, slow indexing, a missed run).
-LOOKBACK_BUFFER_SECONDS = int(os.environ.get("LOOKBACK_BUFFER_SECONDS", "180"))
-STATE_FILE = os.environ.get("STATE_FILE", "seen_issues.json")
+STATE_FILE = os.environ.get("STATE_FILE", "last_event.json")
 RUN_ONCE = os.environ.get("RUN_ONCE", "false").lower() in ("1", "true", "yes")
-# Stop the polling loop after this many seconds (0 = run forever). Used to keep
-# a long-poll inside a single CI job that must finish before the next one starts.
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))
-# Ask GitHub when the label was actually added (1 extra request per new issue).
-SHOW_LABEL_LAG = os.environ.get("SHOW_LABEL_LAG", "true").lower() in ("1", "true", "yes")
-# On a brand new state file: record what already exists without notifying.
-SEED_SILENTLY = os.environ.get("SEED_SILENTLY", "true").lower() in ("1", "true", "yes")
+# How many pages of 100 events to walk back before giving up on catching up.
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
 
-def fail(msg: str) -> None:
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
-
-
-def utcnow() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
-
-
-def iso(moment: dt.datetime) -> str:
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def parse_iso(value: str) -> dt.datetime | None:
-    try:
-        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=dt.timezone.utc
-        )
-    except (ValueError, TypeError):
-        return None
-
-
 # --- GitHub ------------------------------------------------------------------
 
-def gh_get(path_and_query: str):
-    """GET the GitHub API. Returns (parsed_json, headers) or (None, headers)."""
-    url = f"https://api.github.com{path_and_query}"
+def fetch_events(page: int):
+    """One page of repository issue events, newest first. None on failure."""
+    query = urllib.parse.urlencode({"per_page": "100", "page": str(page)})
+    url = f"https://api.github.com/repos/{REPO}/issues/events?{query}"
+
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    req.add_header("User-Agent", "telegram-issue-notifier")
+    req.add_header("User-Agent", "help-wanted-notifier")
     if GITHUB_TOKEN:
         req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode()), dict(resp.headers)
+            return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
-        headers = dict(exc.headers or {})
         if exc.code in (403, 429):
-            remaining = headers.get("x-ratelimit-remaining")
-            reset = headers.get("x-ratelimit-reset")
-            print(
-                f"GitHub rate limited (remaining={remaining}, reset={reset}). "
-                "Set GITHUB_TOKEN or raise POLL_INTERVAL_SECONDS.",
-                file=sys.stderr,
-            )
+            reset = (exc.headers or {}).get("x-ratelimit-reset", "?")
+            print(f"Rate limited (resets at {reset}). Set GITHUB_TOKEN or poll slower.",
+                  file=sys.stderr)
         else:
             print(f"GitHub HTTP {exc.code}: {exc.read().decode()[:200]}", file=sys.stderr)
-        return None, headers
-    except Exception as exc:  # noqa: BLE001 - keep the loop alive
+        return None
+    except Exception as exc:  # noqa: BLE001 - transient errors must not kill the loop
         print(f"GitHub request failed: {exc}", file=sys.stderr)
-        return None, {}
-
-
-def fetch_group_issues(group: dict, since_iso: str | None) -> list[dict]:
-    """Open issues carrying ALL labels of the group, most recently touched first."""
-    query = {
-        "state": "open",
-        "labels": ",".join(group["labels"]),  # comma-separated == AND
-        "sort": "updated",
-        "direction": "desc",
-        "per_page": "100",
-    }
-    if since_iso:
-        query["since"] = since_iso
-
-    data, _ = gh_get(f"/repos/{REPO}/issues?" + urllib.parse.urlencode(query))
-    if not isinstance(data, list):
-        return []
-    # The issues endpoint also returns pull requests; drop them.
-    return [item for item in data if "pull_request" not in item]
-
-
-def labeled_at(issue_number: int, wanted_labels: list[str]) -> dt.datetime | None:
-    """When was the last of the group's labels applied? None if unknown."""
-    data, _ = gh_get(f"/repos/{REPO}/issues/{issue_number}/events?per_page=100")
-    if not isinstance(data, list):
         return None
 
-    wanted = {name.lower() for name in wanted_labels}
-    newest = None
-    for event in data:
-        if event.get("event") != "labeled":
-            continue
-        name = (event.get("label") or {}).get("name", "").lower()
-        if name not in wanted:
-            continue
-        moment = parse_iso(event.get("created_at", ""))
-        if moment and (newest is None or moment > newest):
-            newest = moment
-    return newest
+
+def collect_new_labelings(last_event_id: int):
+    """
+    Walk back through the event stream until we reach last_event_id.
+    Returns (matching_events_oldest_first, newest_event_id_seen).
+    """
+    wanted = LABEL.lower()
+    matches = []
+    newest_id = last_event_id
+
+    for page in range(1, MAX_PAGES + 1):
+        events = fetch_events(page)
+        if events is None:
+            # Request failed. Return what we have; the mark only advances for
+            # events we actually processed, so nothing is silently skipped.
+            return list(reversed(matches)), newest_id
+        if not events:
+            break
+
+        reached_known = False
+        for event in events:
+            event_id = event.get("id", 0)
+            newest_id = max(newest_id, event_id)
+
+            if event_id <= last_event_id:
+                reached_known = True
+                break
+
+            if event.get("event") != "labeled":
+                continue
+            if (event.get("label") or {}).get("name", "").lower() != wanted:
+                continue
+
+            issue = event.get("issue") or {}
+            if "pull_request" in issue:
+                continue  # it's a PR, not an issue
+            matches.append(event)
+
+        if reached_known:
+            break
+    else:
+        print(f"Walked {MAX_PAGES} pages without catching up - some events may "
+              "have been missed. Lower POLL_INTERVAL_SECONDS or raise MAX_PAGES.",
+              file=sys.stderr)
+
+    return list(reversed(matches)), newest_id
 
 
 # --- Telegram ----------------------------------------------------------------
@@ -191,7 +148,7 @@ def send_telegram(text: str) -> bool:
     }).encode()
 
     req = urllib.request.Request(url, data=payload)
-    req.add_header("User-Agent", "telegram-issue-notifier")
+    req.add_header("User-Agent", "help-wanted-notifier")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = json.loads(resp.read().decode())
@@ -204,138 +161,93 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def human_age(delta: dt.timedelta) -> str:
-    seconds = int(delta.total_seconds())
+def age(timestamp: str) -> str:
+    try:
+        moment = dt.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc
+        )
+    except (ValueError, TypeError):
+        return "just now"
+    seconds = int((dt.datetime.now(dt.timezone.utc) - moment).total_seconds())
     if seconds < 90:
-        return f"{seconds}s ago"
+        return f"{max(seconds, 0)}s ago"
     if seconds < 5400:
         return f"{seconds // 60}m ago"
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m ago"
 
 
-def format_message(issue: dict, group: dict, applied: dt.datetime | None) -> str:
-    # Issue titles regularly contain <, > and & -- escaping is required or
-    # Telegram rejects the message with a parse error.
+def format_message(event: dict) -> str:
+    issue = event["issue"]
+    # Titles regularly contain <, > and & - escaping is required or Telegram
+    # rejects the message with a parse error.
     title = html.escape(issue["title"])
-    author = html.escape(issue["user"]["login"])
-    labels = html.escape(", ".join(lbl["name"] for lbl in issue.get("labels", [])))
-    watched = html.escape(" + ".join(group["labels"]))
-
-    lines = [
-        f"{group.get('emoji', '🔔')} <b>{watched}</b>",
-        f"<b>#{issue['number']}</b>: {title}",
-        f"Labels: {labels}",
-        f"By: {author}",
-    ]
-    if applied is not None:
-        lines.append(f"Labeled: {human_age(utcnow() - applied)}")
-    lines.append(issue["html_url"])
-    return "\n".join(lines)
+    actor = html.escape((event.get("actor") or {}).get("login", "someone"))
+    return (
+        f"🙋 <b>{html.escape(LABEL)}</b> · {age(event.get('created_at', ''))}\n"
+        f"<b>#{issue['number']}</b>: {title}\n"
+        f"Labeled by: {actor}\n"
+        f"{issue['html_url']}"
+    )
 
 
 # --- State -------------------------------------------------------------------
 
-def load_state() -> dict:
+def load_last_event_id() -> int:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"version": 2, "seen": {}, "last_check": None}
-
-    # Migrate the old format: a flat list of issue numbers.
-    if isinstance(raw, list):
-        first = WATCH_GROUPS[0]["name"] if WATCH_GROUPS else "default"
-        return {"version": 2, "seen": {first: list(raw)}, "last_check": None}
-
-    raw.setdefault("seen", {})
-    raw.setdefault("last_check", None)
-    return raw
+            return int(json.load(handle).get("last_event_id", 0))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, AttributeError):
+        return 0
 
 
-def save_state(state: dict) -> None:
-    serializable = {
-        "version": 2,
-        "seen": {name: sorted(numbers) for name, numbers in state["seen"].items()},
-        "last_check": state.get("last_check"),
-    }
+def save_last_event_id(event_id: int) -> None:
     tmp = f"{STATE_FILE}.tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(serializable, handle, indent=0)
+        json.dump({"last_event_id": event_id}, handle)
     os.replace(tmp, STATE_FILE)  # atomic: never leave a half-written state file
 
 
-# --- Main loop ---------------------------------------------------------------
+# --- Main --------------------------------------------------------------------
 
-def check_once(state: dict) -> dict:
-    started = utcnow()
-    last_check = parse_iso(state.get("last_check") or "")
-    since = None
-    if last_check:
-        since = iso(last_check - dt.timedelta(seconds=LOOKBACK_BUFFER_SECONDS))
+def check_once() -> None:
+    last_id = load_last_event_id()
+    first_run = last_id == 0
 
-    for group in WATCH_GROUPS:
-        name = group["name"]
-        seen = set(state["seen"].get(name, []))
-        first_run = name not in state["seen"]
+    events, newest_id = collect_new_labelings(last_id)
 
-        # On the first run for a group, look at the whole current backlog
-        # (no `since`) so the state file starts out complete.
-        issues = fetch_group_issues(group, None if first_run else since)
+    if first_run:
+        # Start from now. Nothing that happened before this moment is announced.
+        if newest_id:
+            save_last_event_id(newest_id)
+            print(f"Starting from event {newest_id}. Existing issues ignored.")
+        return
 
-        for issue in issues:
-            number = issue["number"]
-            if number in seen:
-                continue
-            seen.add(number)
+    for event in events:
+        if send_telegram(format_message(event)):
+            print(f"Notified #{event['issue']['number']}: {event['issue']['title'][:80]}")
 
-            if first_run and SEED_SILENTLY:
-                continue
-
-            applied = labeled_at(number, group["labels"]) if SHOW_LABEL_LAG else None
-            if send_telegram(format_message(issue, group, applied)):
-                print(f"[{name}] notified #{number}: {issue['title'][:80]}")
-
-        state["seen"][name] = sorted(seen)
-        if first_run and SEED_SILENTLY:
-            print(f"[{name}] seeded {len(seen)} existing issues without notifying.")
-
-    state["last_check"] = iso(started)
-    save_state(state)
-    return state
+    if newest_id > last_id:
+        save_last_event_id(newest_id)
 
 
 def main() -> None:
     if not BOT_TOKEN or not CHAT_ID:
-        fail("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.")
-    if not WATCH_GROUPS:
-        fail("WATCH_GROUPS is empty - nothing to watch.")
+        print("ERROR: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.", file=sys.stderr)
+        sys.exit(1)
     if not GITHUB_TOKEN:
-        print(
-            "WARNING: no GITHUB_TOKEN. The unauthenticated limit is 60 requests/hour, "
-            "which is too low for short poll intervals.",
-            file=sys.stderr,
-        )
-
-    state = load_state()
-    watching = "; ".join(" + ".join(g["labels"]) for g in WATCH_GROUPS)
+        print("WARNING: no GITHUB_TOKEN - the 60 req/hour anonymous limit is too "
+              "low for short poll intervals.", file=sys.stderr)
 
     if RUN_ONCE:
-        print(f"Checking {REPO} once for: {watching}")
-        check_once(state)
+        check_once()
         return
 
     deadline = time.monotonic() + MAX_RUNTIME_SECONDS if MAX_RUNTIME_SECONDS else None
-    limit = f", stopping after {MAX_RUNTIME_SECONDS}s" if deadline else ""
-    print(f"Watching {REPO} for: {watching} (every {POLL_INTERVAL_SECONDS}s{limit}). Ctrl+C to stop.")
+    print(f"Watching {REPO} for the '{LABEL}' label every {POLL_INTERVAL_SECONDS}s.")
 
     while True:
-        state = check_once(state)
-        if deadline is None:
-            time.sleep(POLL_INTERVAL_SECONDS)
-            continue
-        remaining = deadline - time.monotonic()
-        # Only sleep if a full poll still fits before the deadline.
-        if remaining <= POLL_INTERVAL_SECONDS:
+        check_once()
+        if deadline and (deadline - time.monotonic()) <= POLL_INTERVAL_SECONDS:
             print("Runtime limit reached, exiting cleanly.")
             return
         time.sleep(POLL_INTERVAL_SECONDS)
